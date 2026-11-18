@@ -251,6 +251,163 @@ class Core(Base):
             self.assertEqual(ch.balance(tx, "pool"), 2 * workers * per)
 
 
+
+class BotActions(Base):
+    """Port of agent-lab bot-action-ledger 73128c7 (migration 0007): start / finish / end-of-turn."""
+
+    def bot(self, key, route, body):
+        return self.req("POST", "/bot/" + route, body, {"X-API-Key": key} if key else {})
+
+    def blocks(self):
+        with self.db.tx(write=False) as tx:
+            return [(r[0], r[1], r[2], r[3], json.loads(r[4])) for r in
+                    tx.all("SELECT seq, kind, prev_hash, hash, payload FROM blocks ORDER BY seq")]
+
+    def test_11_start_finish_turn_end_chain_correctly(self):
+        key = self.mint()
+        entries_before = self.counts()[1]
+        st, s1 = self.bot(key, "start", {"bot": "Project Keeper", "action": "commit_made", "detail": "commit fix"})
+        self.assertEqual(st, 200, s1)
+        self.assertRegex(s1["start_id"], r"^start_[0-9a-f]{32}$")
+        st, s2 = self.bot(key, "start", {"bot": "Project Keeper", "action": "check_run", "detail": "smoke"})
+        st, f1 = self.bot(key, "finish", {"bot": "Project Keeper", "start_id": s1["start_id"], "detail": "commit 5524752"})
+        self.assertEqual(st, 200, f1)
+        st, te = self.bot(key, "turn-end", {"bot": "Project Keeper", "detail": "turn done",
+                                            "start_ids": [s1["start_id"], s2["start_id"]]})
+        self.assertEqual(st, 200, te)
+        self.assertEqual(te["open"], [s2["start_id"]])  # the unfinished start is reported, not hidden
+        b = self.blocks()
+        self.assertEqual([x[1] for x in b[2:]], ["bot_start", "bot_start", "bot_finish", "turn_end"])
+        for prev, cur in zip(b, b[1:]):
+            self.assertEqual(cur[2], prev[3])  # every block links to the one before it
+        self.assertEqual(b[4][4]["start_id"], s1["start_id"])
+        self.assertEqual(b[4][4]["action"], "commit_made")  # finish inherits the start's action
+        self.assertEqual(b[5][4]["start_ids"], [s1["start_id"], s2["start_id"]])
+        self.assertEqual(b[2][4]["by"], self.req("GET", "/ledger/balance", headers={"X-API-Key": key})[1]["account"])
+        self.assertTrue(all(x[4]["entries"] == [] for x in b[2:]))
+        self.assertEqual(self.counts()[1], entries_before)  # zero-value: no money moved
+        self.assertEqual(self.credits(key), 500)
+        self.assertEqual(self.verify(), (True, "ok", 6))
+
+    def test_12_finish_unknown_or_duplicate_start_rejected(self):
+        key = self.mint()
+        st, s1 = self.bot(key, "start", {"bot": "Side Assistant", "action": "file_changed", "detail": "a.py"})
+        self.assertEqual(self.bot(key, "finish", {"bot": "Side Assistant", "start_id": s1["start_id"], "detail": "ok"})[0], 200)
+        before = self.counts(), len(self.blocks())
+        cases = [
+            ("finish", {"bot": "Side Assistant", "start_id": s1["start_id"], "detail": "again"}, 409),         # duplicate
+            ("finish", {"bot": "Side Assistant", "start_id": "start_" + "0" * 32, "detail": "x"}, 404),       # unknown
+            ("finish", {"bot": "Side Assistant", "start_id": "'; DROP TABLE blocks;--", "detail": "x"}, 404), # malformed
+            ("finish", {"bot": "Side Assistant", "detail": "x"}, 404),                                       # missing
+            ("turn-end", {"bot": "Side Assistant", "detail": "x", "start_ids": ["start_" + "1" * 32]}, 404),
+            ("turn-end", {"bot": "Side Assistant", "detail": "x", "start_ids": "nope"}, 400),
+            ("start", {"bot": "Side Assistant", "action": "Bad Action!", "detail": "x"}, 400),
+            ("start", {"bot": "", "action": "check_run", "detail": "x"}, 400),
+            ("start", {"bot": "Side Assistant", "action": "check_run", "detail": ""}, 400),
+        ]
+        for route, body, code in cases:
+            st, resp = self.bot(key, route, body)
+            self.assertEqual(st, code, f"{route} {body}: {resp}")
+        st, s2 = self.bot(key, "start", {"bot": "C1 Claims Wording", "action": "check_run", "detail": "x"})
+        before = self.counts(), len(self.blocks())
+        st, resp = self.bot(key, "finish", {"bot": "Side Assistant", "start_id": s2["start_id"], "detail": "steal"})
+        self.assertEqual(st, 409, resp)  # another bot's start
+        self.assertEqual(self.bot(None, "start", {"bot": "x", "action": "check_run", "detail": "x"})[0], 401)
+        self.assertEqual(self.bot("ch_live_bogus", "finish", {"bot": "C1 Claims Wording", "start_id": s2["start_id"], "detail": "x"})[0], 401)
+        self.assertEqual((self.counts(), len(self.blocks())), before)
+        self.assertTrue(self.verify()[0])
+
+    def test_13_bot_block_tampering_makes_verify_fail(self):
+        key = self.mint()
+        _, s1 = self.bot(key, "start", {"bot": "Project Keeper", "action": "status_update", "detail": "go"})
+        _, f1 = self.bot(key, "finish", {"bot": "Project Keeper", "start_id": s1["start_id"], "detail": "done"})
+        with self.db.tx(write=False) as tx:
+            orig = tx.one("SELECT payload FROM blocks WHERE seq = ?", (f1["seq"],))[0]
+        # 1) edit the finish detail: hash mismatch
+        with self.db.tx() as tx:
+            tx.execute("UPDATE blocks SET payload = ? WHERE seq = ?", (orig.replace('"done"', '"forged"'), f1["seq"]))
+        self.assertEqual(self.verify()[1], f"hash mismatch at block {f1['seq']}")
+        # 2) re-point the finish (the chain tail) at a start that never existed AND recompute its hash:
+        #    the hash chain is then internally consistent, so only the start/finish pairing check catches it
+        p = json.loads(orig)
+        p["start_id"] = "start_" + "f" * 32
+        with self.db.tx() as tx:
+            tx.execute("UPDATE blocks SET payload = ?, hash = ? WHERE seq = ?",
+                       (ch.canon(p), ch.block_hash(f1["prev_hash"], p), f1["seq"]))
+        ok, msg, _ = self.verify()
+        self.assertFalse(ok)
+        self.assertIn("finish does not pair", msg)
+        # 3) restore the block, then delete the finish row from the side table: tables disagree with chain
+        with self.db.tx() as tx:
+            tx.execute("UPDATE blocks SET payload = ?, hash = ? WHERE seq = ?", (orig, f1["hash"], f1["seq"]))
+        self.assertTrue(self.verify()[0])
+        with self.db.tx() as tx:
+            tx.execute("DELETE FROM bot_finishes WHERE start_id = ?", (s1["start_id"],))
+        self.assertEqual(self.verify()[1], "bot_starts/bot_finishes tables disagree with the chain")
+
+    def test_14_cli_start_finish_turn_end(self):
+        env = {**os.environ, "DATABASE_URL": self.url}
+        here = os.path.dirname(os.path.abspath(__file__))
+        run = lambda *a: subprocess.run([sys.executable, "cashhound_engine.py", *a], capture_output=True, text=True, env=env, cwd=here)
+        r = run("start", "--bot", "Ledger Durability", "--action", "check_run", "--detail", "pytest")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sid = r.stdout.strip()
+        self.assertRegex(sid, r"^start_[0-9a-f]{32}$")
+        self.assertEqual(run("finish", "--bot", "Ledger Durability", "--start-id", sid, "--detail", "9 passed").returncode, 0)
+        self.assertEqual(run("finish", "--bot", "Ledger Durability", "--start-id", sid, "--detail", "again").returncode, 2)
+        self.assertEqual(run("finish", "--bot", "Ledger Durability", "--start-id", "start_" + "a" * 32, "--detail", "x").returncode, 2)
+        r = run("turn-end", "--bot", "Ledger Durability", "--detail", "turn done", "--start-ids", sid)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["open"], [])
+        self.assertEqual([x[4]["by"] for x in self.blocks()[1:]], ["cli", "cli", "cli"])
+        self.assertEqual(run("verify").returncode, 0)
+
+    def test_15_concurrent_bots_and_commits_keep_chain_valid(self):
+        key = self.mint()
+        bots, per, errors = ["C3 Security Fix", "C1 Claims Wording", "Ledger Durability",
+                             "Proof Path Vertical", "Side Assistant", "Project Keeper"], 5, []
+
+        def worker(bot):
+            sids = []
+            for j in range(per):
+                st, s = self.bot(key, "start", {"bot": bot, "action": "check_run", "detail": f"{bot} {j}"})
+                st2, _ = self.bot(key, "finish", {"bot": bot, "start_id": s.get("start_id"), "detail": "ok"})
+                st3, _ = self.commit(key, {"inflow": 1, "allocations": {"ops": 1}})
+                sids.append(s.get("start_id"))
+                errors.extend(x for x in (st, st2, st3) if x != 200)
+            st, te = self.bot(key, "turn-end", {"bot": bot, "detail": "turn", "start_ids": sids})
+            if st != 200 or te["open"]:
+                errors.append((st, te))
+
+        ts = [threading.Thread(target=worker, args=(b,)) for b in bots]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(errors, [])
+        ok, msg, n = self.verify()
+        self.assertEqual((ok, msg, n), (True, "ok", 2 + len(bots) * (3 * per + 1)))
+        self.assertEqual(self.credits(key), 500 - len(bots) * per)
+        with self.db.tx(write=False) as tx:
+            self.assertEqual(tx.one("SELECT COUNT(*) FROM bot_finishes")[0], len(bots) * per)
+
+    def test_16_schema_step_is_idempotent_and_upgrades_a_v1_ledger(self):
+        for _ in range(2):
+            ch.init_db(self.db)
+        with self.db.tx(write=False) as tx:
+            self.assertEqual(sorted(r[0] for r in tx.all("SELECT version FROM schema_version")), [1, 2])
+        # Roll this DB back to a pre-bot-action ledger (version 1 only) holding a money block...
+        with self.db.tx() as tx:
+            tx.execute("DROP TABLE bot_finishes")
+            tx.execute("DROP TABLE bot_starts")
+            tx.execute("DELETE FROM schema_version WHERE version = 2")
+            ch.append_block(tx, "tx", {"memo": "pre-0007"}, [["a", -1], ["b", 1]])
+        # ...then the next boot applies the 0007 step and the old chain still verifies.
+        ch.init_db(self.db)
+        with self.db.tx(write=False) as tx:
+            self.assertEqual(sorted(r[0] for r in tx.all("SELECT version FROM schema_version")), [1, 2])
+        with self.db.tx() as tx:
+            ch.bot_start(tx, {"bot": "Project Keeper", "action": "status_update", "detail": "after upgrade"}, "test")
+        self.assertEqual(self.verify(), (True, "ok", 3))
+
 if __name__ == "__main__":
     print(f"backend={BACKEND} python={sys.version.split()[0]} started={time.strftime('%F %T %Z')}", flush=True)
     unittest.main(verbosity=2)

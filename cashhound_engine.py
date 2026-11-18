@@ -15,9 +15,17 @@ HTTP
   GET  /healthz             GET /ledger/verify          GET /ledger/balance (X-API-Key)
   POST /webhook/stripe      (Stripe-Signature, HMAC-SHA256, 300 s tolerance)
   POST /ledger/commit       (X-API-Key; {"inflow": int, "allocations": {account: int}, "memo"?})
+  POST /bot/start           (X-API-Key; {"bot", "action", "detail"})        -> start_id
+  POST /bot/finish          (X-API-Key; {"bot", "start_id", "detail"})
+  POST /bot/turn-end        (X-API-Key; {"bot", "detail", "start_ids"?: [...]})
+Bot actions (port of agent-lab bot-action-ledger 73128c7 / migration 0007) are zero-value blocks on the
+same chain: kinds bot_start / bot_finish / turn_end, linked by start_id. See README "Bot actions".
 CLI
   python cashhound_engine.py serve [--host H] [--port P]   (needs STRIPE_WEBHOOK_SECRET)
   python cashhound_engine.py verify                         (exit 0 ok, 1 broken)
+  python cashhound_engine.py start --bot B --action A --detail D             (prints start_id)
+  python cashhound_engine.py finish --bot B --start-id S --detail D
+  python cashhound_engine.py turn-end --bot B --detail D [--start-ids S1,S2]
 """
 from __future__ import annotations
 
@@ -41,6 +49,8 @@ LOCK_ID = 0x0CA5_4011D  # pg_advisory_xact_lock key: one writer at a time on the
 MAX_BODY = 64 * 1024
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 RESERVED = ("key:", "sys:")  # system accounts; never a target of /ledger/commit
+ACTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+START_RE = re.compile(r"^start_[0-9a-f]{32}$")
 
 
 class Reject(Exception):
@@ -132,6 +142,14 @@ SCHEMA = {
         """CREATE TABLE IF NOT EXISTS stripe_events (
              event_id TEXT PRIMARY KEY, seq BIGINT NOT NULL REFERENCES blocks(seq))""",
     ],
+    2: [  # bot actions (agent-lab migration 0007, lean): start-post channel + one finish per start
+        """CREATE TABLE IF NOT EXISTS bot_starts (
+             start_id TEXT PRIMARY KEY, seq BIGINT NOT NULL UNIQUE REFERENCES blocks(seq),
+             bot TEXT NOT NULL, action TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS bot_finishes (
+             start_id TEXT PRIMARY KEY REFERENCES bot_starts(start_id),
+             seq BIGINT NOT NULL UNIQUE REFERENCES blocks(seq))""",
+    ],
 }
 
 
@@ -202,12 +220,83 @@ def commit(tx: Tx, account: str, body: dict) -> dict:
     return append_block(tx, "tx", {"inflow": inflow, "memo": memo, "by": account}, entries)
 
 
+# ---------------------------------------------------------------- bot actions (zero-value blocks)
+def _text(body: dict, field: str, limit: int) -> str:
+    v = body.get(field)
+    if not isinstance(v, str) or not v.strip() or len(v) > limit:
+        raise Reject(400, f"{field} must be a non-empty string of at most {limit} chars")
+    return v
+
+
+def _own_start(tx: Tx, start_id, bot: str):
+    row = tx.one("SELECT bot, action FROM bot_starts WHERE start_id = ?", (start_id,)) \
+        if isinstance(start_id, str) and START_RE.match(start_id) else None
+    if row is None:
+        raise Reject(404, f"unknown start_id {start_id!r}")
+    if row[0] != bot:
+        raise Reject(409, f"start_id {start_id} belongs to another bot")
+    return row
+
+
+def bot_start(tx: Tx, body: dict, by: str) -> dict:
+    bot, detail = _text(body, "bot", 80), _text(body, "detail", 4000)
+    action = body.get("action")
+    if not isinstance(action, str) or not ACTION_RE.match(action):
+        raise Reject(400, "action must match [a-z][a-z0-9_]{0,39}")
+    start_id = "start_" + secrets.token_hex(16)
+    block = append_block(tx, "bot_start", {"bot": bot, "action": action, "detail": detail, "start_id": start_id, "by": by})
+    tx.execute("INSERT INTO bot_starts (start_id, seq, bot, action) VALUES (?, ?, ?, ?)", (start_id, block["seq"], bot, action))
+    return {"start_id": start_id, **block}
+
+
+def bot_finish(tx: Tx, body: dict, by: str) -> dict:
+    bot, detail, start_id = _text(body, "bot", 80), _text(body, "detail", 4000), body.get("start_id")
+    _, action = _own_start(tx, start_id, bot)
+    if tx.one("SELECT seq FROM bot_finishes WHERE start_id = ?", (start_id,)):
+        raise Reject(409, f"start_id {start_id} already finished")
+    block = append_block(tx, "bot_finish", {"bot": bot, "action": action, "detail": detail, "start_id": start_id, "by": by})
+    tx.execute("INSERT INTO bot_finishes (start_id, seq) VALUES (?, ?)", (start_id, block["seq"]))
+    return {"start_id": start_id, **block}
+
+
+def turn_end(tx: Tx, body: dict, by: str) -> dict:
+    bot, detail, ids = _text(body, "bot", 80), _text(body, "detail", 4000), body.get("start_ids", [])
+    if not isinstance(ids, list) or len(ids) > 500 or len(set(map(str, ids))) != len(ids):
+        raise Reject(400, "start_ids must be a list of distinct start ids")
+    for sid in ids:
+        _own_start(tx, sid, bot)
+    still_open = [s for s in ids if not tx.one("SELECT 1 FROM bot_finishes WHERE start_id = ?", (s,))]
+    block = append_block(tx, "turn_end", {"bot": bot, "detail": detail, "start_ids": ids, "open": still_open, "by": by})
+    return {"open": still_open, **block}
+
+
+BOT_ACTIONS = {"/bot/start": bot_start, "/bot/finish": bot_finish, "/bot/turn-end": turn_end}
+
+
+def _verify_bot_links(kind: str, p: dict, starts: dict, finished: set) -> str | None:
+    if kind == "bot_start":
+        if p.get("start_id") in starts or not START_RE.match(str(p.get("start_id"))):
+            return "duplicate or malformed start_id"
+        starts[p["start_id"]] = p.get("bot")
+    elif kind == "bot_finish":
+        sid = p.get("start_id")
+        if starts.get(sid) is None or starts[sid] != p.get("bot") or sid in finished:
+            return f"finish does not pair with an open start of the same bot ({sid})"
+        finished.add(sid)
+    elif kind == "turn_end":
+        if any(starts.get(s) != p.get("bot") for s in p.get("start_ids", [])):
+            return "turn_end names a start that is not this bot's"
+    else:
+        return None
+    return "bot block carries entries" if p.get("entries") else None
+
+
 def verify_chain(tx: Tx) -> tuple[bool, str, int]:
     rows = tx.all("SELECT seq, kind, prev_hash, hash, payload FROM blocks ORDER BY seq")
     stored: dict[int, list] = {}
     for seq, account, amount in tx.all("SELECT seq, account, amount FROM entries ORDER BY seq, account"):
         stored.setdefault(int(seq), []).append([account, int(amount)])
-    prev = GENESIS_PREV
+    prev, starts, finished = GENESIS_PREV, {}, set()
     for i, (seq, kind, prev_hash, h, raw) in enumerate(rows):
         payload = json.loads(raw)
         if seq != i or payload.get("seq") != seq or payload.get("kind") != kind:
@@ -221,12 +310,20 @@ def verify_chain(tx: Tx) -> tuple[bool, str, int]:
             return False, f"zero-sum violation at block {seq}", len(rows)
         if sorted(entries) != stored.get(seq, []):
             return False, f"entries table disagrees with block {seq}", len(rows)
+        bad = _verify_bot_links(kind, payload, starts, finished)
+        if bad:
+            return False, f"{bad} at block {seq}", len(rows)
         prev = h
     if not rows or rows[0][1] != "genesis":
         return False, "genesis missing", len(rows)
     extra = set(stored) - {r[0] for r in rows}
     if extra:
         return False, f"orphan entries for seq {sorted(extra)}", len(rows)
+    chain_starts = {(p["start_id"], r[0]) for r in rows if r[1] == "bot_start" for p in [json.loads(r[4])]}
+    chain_fin = {(p["start_id"], r[0]) for r in rows if r[1] == "bot_finish" for p in [json.loads(r[4])]}
+    if chain_starts != {(a, int(b)) for a, b in tx.all("SELECT start_id, seq FROM bot_starts")} or \
+            chain_fin != {(a, int(b)) for a, b in tx.all("SELECT start_id, seq FROM bot_finishes")}:
+        return False, "bot_starts/bot_finishes tables disagree with the chain", len(rows)
     return True, "ok", len(rows)
 
 
@@ -333,6 +430,11 @@ def make_handler(db: DB, stripe_secret: str):
                     with db.tx() as tx:
                         acct = authenticate(tx, self.headers.get("X-API-Key"))
                         return 200, {"ok": True, **commit(tx, acct, body)}
+                if self.path in BOT_ACTIONS:
+                    body = self._json(self._body())
+                    with db.tx() as tx:
+                        acct = authenticate(tx, self.headers.get("X-API-Key"))
+                        return 200, {"ok": True, **BOT_ACTIONS[self.path](tx, body, acct)}
                 raise Reject(404, "not found")
             self._run(route)
 
@@ -366,6 +468,20 @@ def main(argv: list[str]) -> int:
             ok, msg, n = verify_chain(tx)
         print(json.dumps({"ok": ok, "detail": msg, "blocks": n}))
         return 0 if ok else 1
+    if cmd in ("start", "finish", "turn-end"):  # bots with direct DB access (BOT_WIRING.md style)
+        body = {"bot": _opt(args, "--bot"), "action": _opt(args, "--action"), "detail": _opt(args, "--detail"),
+                "start_id": _opt(args, "--start-id")}
+        if cmd == "turn-end":
+            body["start_ids"] = [s for s in (_opt(args, "--start-ids") or "").split(",") if s]
+        init_db(db)
+        try:
+            with db.tx() as tx:
+                out = BOT_ACTIONS["/bot/" + cmd](tx, body, "cli")
+        except Reject as r:
+            print(json.dumps({"error": r.msg}), file=sys.stderr)
+            return 2
+        print(out["start_id"] if cmd == "start" else json.dumps(out))
+        return 0
     print(__doc__)
     return 2
 

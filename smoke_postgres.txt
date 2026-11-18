@@ -1,0 +1,23 @@
+backend=postgres python=3.13.5 started=2026-11-18 06:28:33 CST
+test_11_start_finish_turn_end_chain_correctly (__main__.BotActions.test_11_start_finish_turn_end_chain_correctly) ... ok
+test_12_finish_unknown_or_duplicate_start_rejected (__main__.BotActions.test_12_finish_unknown_or_duplicate_start_rejected) ... ok
+test_13_bot_block_tampering_makes_verify_fail (__main__.BotActions.test_13_bot_block_tampering_makes_verify_fail) ... ok
+test_14_cli_start_finish_turn_end (__main__.BotActions.test_14_cli_start_finish_turn_end) ... ok
+test_15_concurrent_bots_and_commits_keep_chain_valid (__main__.BotActions.test_15_concurrent_bots_and_commits_keep_chain_valid) ... ok
+test_16_schema_step_is_idempotent_and_upgrades_a_v1_ledger (__main__.BotActions.test_16_schema_step_is_idempotent_and_upgrades_a_v1_ledger) ... ok
+test_01_genesis_present_and_chain_verifies (__main__.Core.test_01_genesis_present_and_chain_verifies) ... ok
+test_02_refuses_to_start_without_webhook_secret (__main__.Core.test_02_refuses_to_start_without_webhook_secret) ... ok
+test_03_webhook_valid_signature_mints_key_with_500_credits (__main__.Core.test_03_webhook_valid_signature_mints_key_with_500_credits) ... ok
+test_04_webhook_bad_signature_rejected (__main__.Core.test_04_webhook_bad_signature_rejected) ... ok
+test_05_webhook_replay_credits_only_once (__main__.Core.test_05_webhook_replay_credits_only_once) ... ok
+test_06_balanced_commit_accepted (__main__.Core.test_06_balanced_commit_accepted) ... ok
+test_07_unbalanced_commit_rejected_nothing_written (__main__.Core.test_07_unbalanced_commit_rejected_nothing_written) ... ok
+test_08_bad_or_missing_api_key_rejected (__main__.Core.test_08_bad_or_missing_api_key_rejected) ... ok
+test_09_tampering_makes_verify_fail (__main__.Core.test_09_tampering_makes_verify_fail) ... ok
+test_10_concurrent_commits_keep_chain_valid (__main__.Core.test_10_concurrent_commits_keep_chain_valid) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 11.226s
+
+OK
+PostgreSQL 17.11 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 7.5.0-3ubuntu1~18.04) 7.5.0, 64-bit

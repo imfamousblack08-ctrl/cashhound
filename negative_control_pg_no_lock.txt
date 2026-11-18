@@ -1,0 +1,40 @@
+# NEGATIVE CONTROL (not part of the suite): temp copy of the engine with pg_advisory_xact_lock removed, PG17 port 55471, 2026-11-18 06:29:04 CST.
+# Expected: concurrency tests FAIL (writers collide on UNIQUE seq/prev_hash -> 500s). The real engine passes them (smoke_postgres.txt).
+backend=postgres python=3.13.5 started=2026-11-18 06:28:54 CST
+test_15_concurrent_bots_and_commits_keep_chain_valid (__main__.BotActions.test_15_concurrent_bots_and_commits_keep_chain_valid) ... FAIL
+test_10_concurrent_commits_keep_chain_valid (__main__.Core.test_10_concurrent_commits_keep_chain_valid) ... FAIL
+
+======================================================================
+FAIL: test_15_concurrent_bots_and_commits_keep_chain_valid (__main__.BotActions.test_15_concurrent_bots_and_commits_keep_chain_valid)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/ch_negctl/smoke_test.py", line 385, in test_15_concurrent_bots_and_commits_keep_chain_valid
+    self.assertEqual(errors, [])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: Lists differ: [500, 404, 500, 500, 404, 500, 404, 500, 5[616 chars]e'})] != []
+
+First list contains 62 additional elements.
+First extra element 0:
+500
+
+Diff is 854 characters long. Set self.maxDiff to None to see it.
+
+======================================================================
+FAIL: test_10_concurrent_commits_keep_chain_valid (__main__.Core.test_10_concurrent_commits_keep_chain_valid)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/ch_negctl/smoke_test.py", line 244, in test_10_concurrent_commits_keep_chain_valid
+    self.assertEqual(errors, [])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+AssertionError: Lists differ: [(500, {'error': 'internal: UniqueViolatio[2679 chars]n'})] != []
+
+First list contains 58 additional elements.
+First extra element 0:
+(500, {'error': 'internal: UniqueViolation'})
+
+Diff is 2905 characters long. Set self.maxDiff to None to see it.
+
+----------------------------------------------------------------------
+Ran 2 tests in 1.493s
+
+FAILED (failures=2)
