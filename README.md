@@ -1,9 +1,7 @@
-# CashHound Engine (reconstruction)
+# CashHound Engine
 
-**This `cashhound_engine.py` is a RECONSTRUCTION written from the owner's verbal description.**
-The original file (extracted from AgentLabs) was pasted into a voice conversation that bots cannot read,
-and it was never on GitHub, Drive, or this computer. Behaviour, names, and wire formats here are best
-guesses. **Pending a diff against the original file** before anything is pushed or deployed.
+This `cashhound_engine.py` was rebuilt from the owner's description; the earlier original was never available to diff.
+On 2026-11-20 the owner (John Handy) confirmed this rebuild as the authoritative version.
 
 One file, Python stdlib only (`http.server`, `sqlite3`, `hashlib`, `hmac`, `json`, `secrets`), plus the
 optional `psycopg` (v3) import used only when `DATABASE_URL` is a Postgres URL.
