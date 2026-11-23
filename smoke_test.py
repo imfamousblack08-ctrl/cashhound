@@ -83,9 +83,9 @@ class Base(unittest.TestCase):
     def sid(event_id):  # a well-formed Checkout Session id derived from the event id
         return "cs_test_" + hashlib.sha256(event_id.encode()).hexdigest()[:40]
 
-    def webhook(self, event_id="evt_1", etype="checkout.session.completed", sig=None, session=None):
+    def webhook(self, event_id="evt_1", etype="checkout.session.completed", sig=None, session=None, status="paid"):
         raw = json.dumps({"id": event_id, "type": etype,
-                          "data": {"object": {"id": session or self.sid(event_id)}}}).encode()
+                          "data": {"object": {"id": session or self.sid(event_id), "payment_status": status}}}).encode()
         return self.req("POST", "/webhook/stripe", raw, {"Stripe-Signature": sig(raw) if sig else sign(raw)})
 
     def claim(self, session):
@@ -387,10 +387,11 @@ class KeyDelivery(Base):
             self.assertEqual(tx.one("SELECT COUNT(*) FROM stripe_mints")[0], 1)
             self.assertEqual(tx.one("SELECT COUNT(*) FROM key_reveals")[0], 1)
             self.assertEqual(ch.balance(tx, "sys:stripe_clearing"), -500)
-        with self.assertRaises(Exception):  # the UNIQUE (session_id, event_type) constraint itself holds
-            with self.db.tx() as tx:
-                tx.execute("INSERT INTO stripe_mints (session_id, event_type, event_id, seq) VALUES (?, ?, 'evt_Z', 1)",
-                           (sess, "checkout.session.completed"))
+        for et in ch.MINT_EVENTS:  # the UNIQUE (session_id) constraint itself holds, whatever the event type
+            with self.assertRaises(Exception):
+                with self.db.tx() as tx:
+                    tx.execute("INSERT INTO stripe_mints (session_id, event_type, event_id, seq) VALUES (?, ?, 'evt_Z', 1)",
+                               (sess, et))
         self.assertEqual(self.claim(sess)[0], 200)
         self.assertTrue(self.verify()[0])
 
@@ -421,6 +422,58 @@ class KeyDelivery(Base):
         finally:
             proc.terminate()
             proc.communicate(timeout=10)
+
+
+class PaidGate(Base):
+    OK_ = "checkout.session.async_payment_succeeded"
+    FAIL_ = "checkout.session.async_payment_failed"
+
+    def mints(self):
+        with self.db.tx(write=False) as tx:
+            return (tx.one("SELECT COUNT(*) FROM stripe_mints")[0], tx.one("SELECT COUNT(*) FROM key_reveals")[0],
+                    ch.balance(tx, "sys:stripe_clearing"))
+
+    def test_18_unpaid_completed_mints_nothing(self):
+        before, head = self.counts(), self.head()
+        for status in ("unpaid", "no_payment_required", None):
+            st, body = self.webhook("evt_u_" + str(status), session=self.sid("s_u"), status=status)
+            self.assertEqual((st, body.get("pending"), "api_key" in body), (200, True, False), status)
+        st, body = self.webhook("evt_f", etype=self.FAIL_, session=self.sid("s_u"), status="unpaid")
+        self.assertEqual((st, body.get("payment_failed")), (200, True))
+        self.assertEqual((self.counts(), self.head(), self.mints()), (before, head, (0, 0, 0)))
+        st, page = self.claim(self.sid("s_u"))
+        self.assertEqual(st, 404)
+        self.assertIsNone(self.key_in(page))
+
+    def test_19_unpaid_then_async_succeeded_mints_exactly_once(self):
+        sess = self.sid("s_async")
+        self.assertEqual(self.webhook("evt_c", session=sess, status="unpaid")[1].get("pending"), True)
+        st, body = self.webhook("evt_ok", etype=self.OK_, session=sess)
+        self.assertEqual((st, body.get("credits"), body.get("duplicate")), (200, 500, None))
+        for eid, et in (("evt_ok", self.OK_), ("evt_ok2", self.OK_), ("evt_c", "checkout.session.completed")):
+            self.assertEqual(self.webhook(eid, etype=et, session=sess)[1].get("duplicate"), True, eid)
+        self.assertEqual(self.mints(), (1, 1, -500))
+        key = self.key_in(self.claim(sess)[1])
+        self.assertEqual(self.credits(key), 500)
+        self.assertTrue(self.verify()[0])
+
+    def test_20_completed_paid_plus_async_succeeded_mints_once_either_order(self):
+        a, b = self.sid("s_ab"), self.sid("s_ba")
+        self.assertEqual(self.webhook("evt_ab1", session=a)[1].get("credits"), 500)
+        before, head = self.counts(), self.head()
+        self.assertEqual(self.webhook("evt_ab2", etype=self.OK_, session=a)[1].get("duplicate"), True)
+        self.assertEqual((self.counts(), self.head()), (before, head))
+        self.assertEqual(self.webhook("evt_ba1", etype=self.OK_, session=b)[1].get("credits"), 500)
+        self.assertEqual(self.webhook("evt_ba2", session=b)[1].get("duplicate"), True)
+        out = []  # both event types racing for one fresh session: still a single mint
+        ts = [threading.Thread(target=lambda i=i: out.append(self.webhook(
+            f"evt_r{i}", etype=(self.OK_ if i % 2 else "checkout.session.completed"), session=self.sid("s_race"))))
+            for i in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(sorted(b.get("duplicate", False) for _, b in out), [False] + [True] * 7)
+        self.assertEqual(self.mints(), (3, 3, -1500))
+        self.assertTrue(self.verify()[0])
 
 
 if __name__ == "__main__":

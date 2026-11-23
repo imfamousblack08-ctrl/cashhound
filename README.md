@@ -4,7 +4,8 @@ This `cashhound_engine.py` was rebuilt from the owner's description; the earlier
 On 2026-11-20 the owner (John Handy) confirmed this rebuild as the authoritative version.
 
 One file, Python stdlib only (`http.server`, `sqlite3`, `hashlib`, `hmac`, `json`, `secrets`), plus the
-optional `psycopg` (v3) import used only when `DATABASE_URL` is a Postgres URL.
+optional `psycopg` (v3) import used only when `DATABASE_URL` is a Postgres URL (`pip install -r requirements.txt`
+installs `psycopg[binary]==3.3.9`; tested on Python 3.13.5).
 
 ## Spine
 - Blocks: `hash = sha256(canonical_json({"prev_hash": prev, "payload": payload}))`, canonical JSON =
@@ -27,7 +28,7 @@ optional `psycopg` (v3) import used only when `DATABASE_URL` is a Postgres URL.
 | `GET /ledger/verify` | chain check (200 ok / 500 broken) |
 | `GET /ledger/balance` | `X-API-Key` → credits left on that key |
 | `GET /claim?session_id=cs_...` | One-time HTML reveal of the key minted for that Checkout Session (see "Buyer key delivery"). |
-| `POST /webhook/stripe` | `Stripe-Signature` (`t=`, `v1=`, HMAC-SHA256 over `t.payload`, 300 s tolerance, `hmac.compare_digest`). On `checkout.session.completed`: mint `ch_live_` + `token_urlsafe(32)`, store its sha256 in `api_keys`, commit `sys:stripe_clearing -500 / key:<hash24> +500` (block records event id + session id, never the key), and park the plaintext in `key_reveals` for `/claim`. The key is **not** in the webhook response (that goes to Stripe). Idempotent on the Stripe event id **and** on `(data.object.id, event.type)` (UNIQUE in `stripe_mints`): a second, distinct event for the same session returns `200 {"duplicate": true}` and writes nothing to the chain. `data.object.id` must look like `cs_...` (else 400). Other event types: 200, ignored. |
+| `POST /webhook/stripe` | `Stripe-Signature` (`t=`, `v1=`, HMAC-SHA256 over `t.payload`, 300 s tolerance, `hmac.compare_digest`). On `checkout.session.completed` or `checkout.session.async_payment_succeeded`, **only if `data.object.payment_status == "paid"`** (otherwise `200 {"pending": true}`, nothing written; a delayed method mints on `async_payment_succeeded`): mint `ch_live_` + `token_urlsafe(32)`, store its sha256 in `api_keys`, commit `sys:stripe_clearing -500 / key:<hash24> +500` (block records event id + session id, never the key), and park the plaintext in `key_reveals` for `/claim`. The key is **not** in the webhook response (that goes to Stripe). Idempotent on the Stripe event id **and** on the session: `stripe_mints.session_id` is the PRIMARY KEY, so one session mints at most once whichever of the two events arrive (a later one returns `200 {"duplicate": true}` and writes nothing to the chain). `checkout.session.async_payment_failed`: `200 {"payment_failed": true}`, nothing written. `data.object.id` must look like `cs_...` (else 400). Other event types: 200, ignored. Subscribe the Stripe webhook endpoint to all three `checkout.session.*` events. |
 | `POST /ledger/commit` | `X-API-Key`; body `{"inflow": int, "allocations": {"acct": int, ...}, "memo"?: str}`. `inflow` is drawn from the key's credits and must equal `sum(allocations)`; otherwise 400 and nothing written. 402 if the key holds fewer credits than `inflow`. |
 
 ## Buyer key delivery

@@ -45,6 +45,7 @@ MAX_BODY = 64 * 1024
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 RESERVED = ("key:", "sys:")  # system accounts; never a target of /ledger/commit
 REVEAL_TTL_MS = 24 * 3600 * 1000  # unclaimed plaintext keys are purged after this
+MINT_EVENTS = ("checkout.session.completed", "checkout.session.async_payment_succeeded")  # mint only if paid
 SESSION_RE = re.compile(r"^cs_(?:test_|live_)?[A-Za-z0-9]{8,250}$")  # Stripe Checkout Session id
 
 
@@ -137,10 +138,10 @@ SCHEMA = {
         """CREATE TABLE IF NOT EXISTS stripe_events (
              event_id TEXT PRIMARY KEY, seq BIGINT NOT NULL REFERENCES blocks(seq))""",
     ],
-    2: [  # key delivery: one mint per (checkout session, event type); one-time plaintext reveal OFF the chain
+    2: [  # key delivery: at most ONE mint per checkout session (any event type); one-time plaintext reveal OFF the chain
         """CREATE TABLE IF NOT EXISTS stripe_mints (
-             session_id TEXT NOT NULL, event_type TEXT NOT NULL, event_id TEXT NOT NULL,
-             seq BIGINT NOT NULL REFERENCES blocks(seq), UNIQUE (session_id, event_type))""",
+             session_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, event_id TEXT NOT NULL,
+             seq BIGINT NOT NULL REFERENCES blocks(seq))""",
         """CREATE TABLE IF NOT EXISTS key_reveals (
              session_id TEXT PRIMARY KEY, api_key TEXT, credits BIGINT NOT NULL,
              created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, claimed_at BIGINT)""",
@@ -269,19 +270,23 @@ def handle_stripe_event(db: DB, event: dict) -> dict:
     event_id, etype = event.get("id"), event.get("type")
     if not isinstance(event_id, str) or not event_id:
         raise Reject(400, "event id missing")
-    if etype != "checkout.session.completed":
+    if etype == "checkout.session.async_payment_failed":
+        return {"received": True, "payment_failed": True}  # nothing minted, nothing written
+    if etype not in MINT_EVENTS:
         return {"received": True, "ignored": etype}
     data = event.get("data")
     obj = data.get("object") if isinstance(data, dict) else None
     session_id = obj.get("id") if isinstance(obj, dict) else None
     if not isinstance(session_id, str) or not SESSION_RE.match(session_id):
         raise Reject(400, "data.object.id is not a Checkout Session id")
+    if obj.get("payment_status") != "paid":  # e.g. "unpaid" on a delayed method: wait for async_payment_succeeded
+        return {"received": True, "pending": True}
     with db.tx() as tx:
         purge_reveals(tx)
         if tx.one("SELECT seq FROM stripe_events WHERE event_id = ?", (event_id,)):
             return {"received": True, "duplicate": True}
-        prior = tx.one("SELECT seq FROM stripe_mints WHERE session_id = ? AND event_type = ?", (session_id, etype))
-        if prior:  # a distinct event for an already-minted session: remember the event id, write nothing to the chain
+        prior = tx.one("SELECT seq FROM stripe_mints WHERE session_id = ?", (session_id,))
+        if prior:  # a distinct event (either type) for an already-minted session: remember the event id, write nothing to the chain
             tx.execute("INSERT INTO stripe_events (event_id, seq) VALUES (?, ?)", (event_id, prior[0]))
             return {"received": True, "duplicate": True}
         key = KEY_PREFIX + secrets.token_urlsafe(32)
