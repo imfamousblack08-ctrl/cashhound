@@ -13,16 +13,18 @@ Backends
   * Postgres (DATABASE_URL=postgresql://...): psycopg 3, one transaction + pg_advisory_xact_lock.
 HTTP
   GET  /healthz             GET /ledger/verify          GET /ledger/balance (X-API-Key)
+  GET  /claim?session_id=cs_...   one-time HTML reveal of the key minted for that Checkout Session (24 h)
   POST /webhook/stripe      (Stripe-Signature, HMAC-SHA256, 300 s tolerance)
   POST /ledger/commit       (X-API-Key; {"inflow": int, "allocations": {account: int}, "memo"?})
 CLI
-  python cashhound_engine.py serve [--host H] [--port P]   (needs STRIPE_WEBHOOK_SECRET)
+  python cashhound_engine.py serve [--host H] [--port P]   (needs STRIPE_WEBHOOK_SECRET; $HOST/$PORT honored)
   python cashhound_engine.py verify                         (exit 0 ok, 1 broken)
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
@@ -31,6 +33,7 @@ import sqlite3
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 GENESIS_SEED = "GENESIS_ZERO_SUM_SPINE"
 GENESIS_PREV = hashlib.sha256(GENESIS_SEED.encode()).hexdigest()
@@ -41,6 +44,8 @@ LOCK_ID = 0x0CA5_4011D  # pg_advisory_xact_lock key: one writer at a time on the
 MAX_BODY = 64 * 1024
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 RESERVED = ("key:", "sys:")  # system accounts; never a target of /ledger/commit
+REVEAL_TTL_MS = 24 * 3600 * 1000  # unclaimed plaintext keys are purged after this
+SESSION_RE = re.compile(r"^cs_(?:test_|live_)?[A-Za-z0-9]{8,250}$")  # Stripe Checkout Session id
 
 
 class Reject(Exception):
@@ -131,6 +136,15 @@ SCHEMA = {
              key_hash TEXT PRIMARY KEY, account TEXT NOT NULL UNIQUE, created_at BIGINT NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS stripe_events (
              event_id TEXT PRIMARY KEY, seq BIGINT NOT NULL REFERENCES blocks(seq))""",
+    ],
+    2: [  # key delivery: one mint per (checkout session, event type); one-time plaintext reveal OFF the chain
+        """CREATE TABLE IF NOT EXISTS stripe_mints (
+             session_id TEXT NOT NULL, event_type TEXT NOT NULL, event_id TEXT NOT NULL,
+             seq BIGINT NOT NULL REFERENCES blocks(seq), UNIQUE (session_id, event_type))""",
+        """CREATE TABLE IF NOT EXISTS key_reveals (
+             session_id TEXT PRIMARY KEY, api_key TEXT, credits BIGINT NOT NULL,
+             created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, claimed_at BIGINT)""",
+        "CREATE INDEX IF NOT EXISTS ix_key_reveals_expires ON key_reveals(expires_at)",
     ],
 }
 
@@ -247,24 +261,75 @@ def verify_stripe_signature(payload: bytes, header: str | None, secret: str, now
         raise Reject(400, "bad Stripe-Signature")
 
 
+def purge_reveals(tx: Tx) -> None:
+    tx.execute("DELETE FROM key_reveals WHERE expires_at < ?", (now_ms(),))
+
+
 def handle_stripe_event(db: DB, event: dict) -> dict:
     event_id, etype = event.get("id"), event.get("type")
     if not isinstance(event_id, str) or not event_id:
         raise Reject(400, "event id missing")
     if etype != "checkout.session.completed":
         return {"received": True, "ignored": etype}
+    data = event.get("data")
+    obj = data.get("object") if isinstance(data, dict) else None
+    session_id = obj.get("id") if isinstance(obj, dict) else None
+    if not isinstance(session_id, str) or not SESSION_RE.match(session_id):
+        raise Reject(400, "data.object.id is not a Checkout Session id")
     with db.tx() as tx:
+        purge_reveals(tx)
         if tx.one("SELECT seq FROM stripe_events WHERE event_id = ?", (event_id,)):
+            return {"received": True, "duplicate": True}
+        prior = tx.one("SELECT seq FROM stripe_mints WHERE session_id = ? AND event_type = ?", (session_id, etype))
+        if prior:  # a distinct event for an already-minted session: remember the event id, write nothing to the chain
+            tx.execute("INSERT INTO stripe_events (event_id, seq) VALUES (?, ?)", (event_id, prior[0]))
             return {"received": True, "duplicate": True}
         key = KEY_PREFIX + secrets.token_urlsafe(32)
         key_hash = hashlib.sha256(key.encode()).hexdigest()
         account = "key:" + key_hash[:24]
-        tx.execute("INSERT INTO api_keys (key_hash, account, created_at) VALUES (?, ?, ?)", (key_hash, account, now_ms()))
-        block = append_block(tx, "tx", {"inflow": MINT_CREDITS, "memo": "stripe checkout mint", "stripe_event": event_id},
+        t = now_ms()
+        tx.execute("INSERT INTO api_keys (key_hash, account, created_at) VALUES (?, ?, ?)", (key_hash, account, t))
+        block = append_block(tx, "tx", {"inflow": MINT_CREDITS, "memo": "stripe checkout mint", "stripe_event": event_id,
+                                        "stripe_session": session_id},
                              [["sys:stripe_clearing", -MINT_CREDITS], [account, MINT_CREDITS]])
         tx.execute("INSERT INTO stripe_events (event_id, seq) VALUES (?, ?)", (event_id, block["seq"]))
-    # Shown exactly once; only its sha256 is stored. (Buyer delivery path: see README "Open questions".)
-    return {"received": True, "api_key": key, "credits": MINT_CREDITS, "seq": block["seq"]}
+        tx.execute("INSERT INTO stripe_mints (session_id, event_type, event_id, seq) VALUES (?, ?, ?, ?)",
+                   (session_id, etype, event_id, block["seq"]))
+        # Plaintext lives only here (never in a block payload) until the buyer claims it or it expires.
+        tx.execute("INSERT INTO key_reveals (session_id, api_key, credits, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                   (session_id, key, MINT_CREDITS, t, t + REVEAL_TTL_MS))
+    # The key is NOT returned here: this response goes to Stripe, not the buyer. The buyer gets it via /claim.
+    return {"received": True, "credits": MINT_CREDITS, "seq": block["seq"]}
+
+
+def claim_key(db: DB, session_id: str | None) -> tuple[int, str, str]:
+    """One-time reveal. Returns (status, title, html body). Plaintext is deleted in the same transaction."""
+    if not isinstance(session_id, str) or not SESSION_RE.match(session_id):
+        return 400, "Invalid link", "<p>This link is missing a valid checkout session id.</p>"
+    with db.tx() as tx:
+        purge_reveals(tx)
+        row = tx.one("SELECT api_key, credits, claimed_at FROM key_reveals WHERE session_id = ?", (session_id,))
+        if row and row[0]:
+            cur = tx.execute("UPDATE key_reveals SET api_key = NULL, claimed_at = ? WHERE session_id = ? AND api_key IS NOT NULL",
+                             (now_ms(), session_id))
+            if cur.rowcount == 1:
+                key, credits = row[0], int(row[1])
+                return 200, "Your CashHound API key", (
+                    "<p><strong>Copy this key now. It is shown only once and cannot be shown again.</strong></p>"
+                    f"<pre>{html.escape(key)}</pre>"
+                    f"<p>Credits on this key: {credits}.</p>"
+                    "<p>Use it in the <code>X-API-Key</code> header on <code>POST /ledger/commit</code>, e.g.</p>"
+                    "<pre>curl -X POST https://&lt;this host&gt;/ledger/commit -H 'X-API-Key: &lt;your key&gt;' "
+                    "-H 'Content-Type: application/json' -d '{\"inflow\": 10, \"allocations\": {\"ops\": 10}}'</pre>"
+                    "<p>Check what is left with <code>GET /ledger/balance</code> and the same header.</p>")
+        if row:
+            return 410, "Already claimed", "<p>The key for this checkout was already shown once and cannot be shown again.</p>"
+        if tx.one("SELECT 1 FROM stripe_mints WHERE session_id = ?", (session_id,)):
+            return 410, "No longer available", ("<p>The key for this checkout was minted, but it is no longer viewable here: "
+                                                "it was already claimed or the 24-hour reveal window passed.</p>")
+    return 404, "Payment processing", ("<p>We have not received payment confirmation for this checkout yet. "
+                                       "If you just paid, refresh in a few seconds.</p>"
+                                       "<p>If this persists for more than a few minutes, this checkout id is not known here.</p>")
 
 
 # ---------------------------------------------------------------- HTTP
@@ -281,6 +346,18 @@ def make_handler(db: DB, stripe_secret: str):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_html(self, status: int, title: str, body: str):
+            data = (f"<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"robots\" content=\"noindex\">"
+                    f"<title>{html.escape(title)}</title></head><body><h1>{html.escape(title)}</h1>{body}</body></html>").encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(data)
 
@@ -308,6 +385,15 @@ def make_handler(db: DB, stripe_secret: str):
                 self._send(500, {"error": f"internal: {type(e).__name__}"})
 
         def do_GET(self):
+            url = urlsplit(self.path)
+            if url.path == "/claim":
+                try:
+                    vals = parse_qs(url.query).get("session_id", [])
+                    self._send_html(*claim_key(db, vals[0] if len(vals) == 1 else None))
+                except Exception as e:
+                    self._send_html(500, "Error", f"<p>internal error ({html.escape(type(e).__name__)}); nothing was revealed.</p>")
+                return
+
             def route():
                 if self.path == "/healthz":
                     return 200, {"ok": True, "backend": db.backend}
@@ -356,7 +442,7 @@ def main(argv: list[str]) -> int:
     db = DB()
     if cmd == "serve":
         srv = make_server(db, os.environ.get("STRIPE_WEBHOOK_SECRET", ""),
-                          _opt(args, "--host", "127.0.0.1"), int(_opt(args, "--port", os.environ.get("PORT", "8080"))))
+                          _opt(args, "--host", os.environ.get("HOST", "127.0.0.1")), int(_opt(args, "--port", os.environ.get("PORT", "8080"))))
         print(f"CashHound on {srv.server_address} backend={db.backend}", flush=True)
         srv.serve_forever()
         return 0

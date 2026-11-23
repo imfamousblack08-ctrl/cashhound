@@ -26,8 +26,23 @@ optional `psycopg` (v3) import used only when `DATABASE_URL` is a Postgres URL.
 | `GET /healthz` | `{"ok": true, "backend": ...}` |
 | `GET /ledger/verify` | chain check (200 ok / 500 broken) |
 | `GET /ledger/balance` | `X-API-Key` → credits left on that key |
-| `POST /webhook/stripe` | `Stripe-Signature` (`t=`, `v1=`, HMAC-SHA256 over `t.payload`, 300 s tolerance, `hmac.compare_digest`). On `checkout.session.completed`: mint `ch_live_` + `token_urlsafe(32)`, store only its sha256, commit `sys:stripe_clearing -500 / key:<hash24> +500`. Idempotent on the Stripe event id. Other event types: 200, ignored. |
+| `GET /claim?session_id=cs_...` | One-time HTML reveal of the key minted for that Checkout Session (see "Buyer key delivery"). |
+| `POST /webhook/stripe` | `Stripe-Signature` (`t=`, `v1=`, HMAC-SHA256 over `t.payload`, 300 s tolerance, `hmac.compare_digest`). On `checkout.session.completed`: mint `ch_live_` + `token_urlsafe(32)`, store its sha256 in `api_keys`, commit `sys:stripe_clearing -500 / key:<hash24> +500` (block records event id + session id, never the key), and park the plaintext in `key_reveals` for `/claim`. The key is **not** in the webhook response (that goes to Stripe). Idempotent on the Stripe event id **and** on `(data.object.id, event.type)` (UNIQUE in `stripe_mints`): a second, distinct event for the same session returns `200 {"duplicate": true}` and writes nothing to the chain. `data.object.id` must look like `cs_...` (else 400). Other event types: 200, ignored. |
 | `POST /ledger/commit` | `X-API-Key`; body `{"inflow": int, "allocations": {"acct": int, ...}, "memo"?: str}`. `inflow` is drawn from the key's credits and must equal `sum(allocations)`; otherwise 400 and nothing written. 402 if the key holds fewer credits than `inflow`. |
+
+## Buyer key delivery
+- Set the Stripe Payment Link's success URL (after-payment redirect) to
+  `https://<host>/claim?session_id={CHECKOUT_SESSION_ID}` (Stripe fills in the literal `{CHECKOUT_SESSION_ID}`).
+- The plaintext key is kept only in the `key_reveals` table, outside every block payload, until it is claimed.
+- `GET /claim` shows the key, its credits, and how to send it as `X-API-Key` to `POST /ledger/commit`, then sets the
+  stored plaintext to NULL in the same transaction. Responses carry `Cache-Control: no-store`,
+  `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`.
+- 200 = revealed (once) · 410 = already claimed, or minted but the 24 h window passed · 400 = malformed `session_id`
+  (`^cs_(test_|live_)?[A-Za-z0-9]{8,250}$`) · 404 = no mint for that session yet: the page says "payment processing,
+  refresh in a few seconds". The engine has no Stripe API key, so it cannot tell "webhook not arrived yet" from
+  "unknown id"; both are 404 with that page.
+- Unclaimed reveals expire after 24 h and are purged on the next webhook or claim. After that the key still works
+  but nobody can see it again (no recovery path yet).
 
 ## Run
 ```bash
@@ -35,6 +50,9 @@ export STRIPE_WEBHOOK_SECRET=whsec_...      # required: the server refuses to st
 python cashhound_engine.py serve --port 8080
 python cashhound_engine.py verify           # exit 0 ok, 1 broken
 ```
+Environment: `STRIPE_WEBHOOK_SECRET` (required), `DATABASE_URL` (default `./cashhound.sqlite3`; Postgres URL needs
+`psycopg`), `PORT` (used when `--port` is not given; default 8080), `HOST` (used when `--host` is not given; default
+`127.0.0.1`; set `HOST=0.0.0.0` on Render or any container host), `CASHHOUND_LOG` (optional, request logging).
 
 ## Tests
 ```bash
@@ -43,7 +61,6 @@ CASHHOUND_TEST_PG_ADMIN=postgresql://postgres@127.0.0.1:PORT/postgres python smo
 ```
 
 ## Open questions for the diff against the original
-- How the buyer receives the minted key. Here it is returned once in the webhook response body (which goes to Stripe, not the buyer); the original may have used a success-page reveal or email.
 - Whether `/ledger/commit` spends the key's credits (chosen here) or records an external inflow unrelated to credits.
 - Body field names (`inflow`, `allocations`), account naming (`key:`, `sys:` reserved), status codes.
 - No append-only DB triggers / row-level security: tampering is detected by `verify`, not prevented.

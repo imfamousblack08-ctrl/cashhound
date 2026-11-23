@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -71,14 +72,45 @@ class Base(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
 
-    def webhook(self, event_id="evt_1", etype="checkout.session.completed", sig=None):
-        raw = json.dumps({"id": event_id, "type": etype, "data": {"object": {"id": "cs_" + event_id}}}).encode()
+    def raw_get(self, path):
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=30) as resp:
+                return resp.status, dict(resp.headers), resp.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read().decode()
+
+    @staticmethod
+    def sid(event_id):  # a well-formed Checkout Session id derived from the event id
+        return "cs_test_" + hashlib.sha256(event_id.encode()).hexdigest()[:40]
+
+    def webhook(self, event_id="evt_1", etype="checkout.session.completed", sig=None, session=None):
+        raw = json.dumps({"id": event_id, "type": etype,
+                          "data": {"object": {"id": session or self.sid(event_id)}}}).encode()
         return self.req("POST", "/webhook/stripe", raw, {"Stripe-Signature": sig(raw) if sig else sign(raw)})
+
+    def claim(self, session):
+        st, headers, page = self.raw_get("/claim?session_id=" + session)
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+        self.assertEqual(headers.get("Referrer-Policy"), "no-referrer")
+        self.assertTrue(headers.get("Content-Type", "").startswith("text/html"))
+        return st, page
+
+    @staticmethod
+    def key_in(page):
+        found = [w for w in page.replace("<", " ").replace(">", " ").split() if w.startswith("ch_live_")]
+        return found[0] if found else None
 
     def mint(self, event_id="evt_1") -> str:
         st, body = self.webhook(event_id)
         self.assertEqual(st, 200, body)
-        return body["api_key"]
+        self.assertNotIn("api_key", body)  # the webhook response goes to Stripe, never the key
+        st, page = self.claim(self.sid(event_id))
+        self.assertEqual(st, 200, page)
+        return self.key_in(page)
+
+    def head(self):
+        with self.db.tx(write=False) as tx:
+            return tx.one("SELECT seq, hash FROM blocks ORDER BY seq DESC LIMIT 1")
 
     def commit(self, key, body):
         return self.req("POST", "/ledger/commit", body, {"X-API-Key": key} if key else {})
@@ -123,6 +155,7 @@ class Core(Base):
         self.assertEqual(self.credits(key), 500)
         with self.db.tx(write=False) as tx:
             stored = [r[0] for r in tx.all("SELECT key_hash FROM api_keys")]
+            self.assertEqual(tx.all("SELECT api_key FROM key_reveals"), [(None,)])  # plaintext gone after claim
             self.assertEqual(ch.balance(tx, "sys:stripe_clearing"), -500)
         self.assertEqual(stored, [hashlib.sha256(key.encode()).hexdigest()])  # only the hash is stored
         self.assertTrue(self.verify()[0])
@@ -249,6 +282,145 @@ class Core(Base):
         with self.db.tx(write=False) as tx:
             self.assertEqual(tx.one("SELECT COUNT(DISTINCT prev_hash) FROM blocks")[0], n)  # no forks
             self.assertEqual(ch.balance(tx, "pool"), 2 * workers * per)
+
+
+class KeyDelivery(Base):
+    def test_11_claim_reveals_key_once_with_usage_copy(self):
+        self.assertEqual(self.webhook("evt_c1")[0], 200)
+        st, page = self.claim(self.sid("evt_c1"))
+        self.assertEqual(st, 200, page)
+        key = self.key_in(page)
+        self.assertTrue(key and key.startswith("ch_live_"))
+        for text in ("shown only once", "Credits on this key: 500", "X-API-Key", "/ledger/commit"):
+            self.assertIn(text, page)
+        self.assertEqual(self.credits(key), 500)
+        self.assertEqual(self.commit(key, {"inflow": 10, "allocations": {"ops": 10}})[0], 200)
+        with self.db.tx(write=False) as tx:
+            api_key, claimed_at = tx.one("SELECT api_key, claimed_at FROM key_reveals WHERE session_id = ?", (self.sid("evt_c1"),))
+        self.assertIsNone(api_key)
+        self.assertIsNotNone(claimed_at)
+
+    def test_12_second_claim_refused_even_when_concurrent(self):
+        self.webhook("evt_c2")
+        st, page = self.claim(self.sid("evt_c2"))
+        self.assertEqual(st, 200)
+        for _ in range(2):
+            st, page2 = self.claim(self.sid("evt_c2"))
+            self.assertEqual(st, 410)
+            self.assertIn("already shown once", page2)
+            self.assertIsNone(self.key_in(page2))
+        self.webhook("evt_c2b")
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(self.claim(self.sid("evt_c2b")))) for _ in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(sorted(st for st, _ in out), [200] + [410] * 7)
+        self.assertEqual(sum(1 for _, p in out if self.key_in(p)), 1)
+
+    def test_13_unknown_or_pending_404_and_malformed_400(self):
+        sid = self.sid("evt_late")
+        st, page = self.claim(sid)
+        self.assertEqual(st, 404)
+        self.assertIn("refresh in a few seconds", page)
+        for bad in ("", "pi_123456789012", "cs_short", "cs_test_abc%27%3Cscript%3E1234567", "cs_test_" + "a" * 300,
+                    sid + "&session_id=" + sid):
+            st, page = self.claim(bad)
+            self.assertEqual(st, 400, bad)
+        self.assertEqual(self.raw_get("/claim")[0], 400)
+        self.webhook("evt_late")  # webhook arrives after the buyer landed: refresh now works
+        st, page = self.claim(sid)
+        self.assertEqual(st, 200)
+        raw = json.dumps({"id": "evt_badsess", "type": "checkout.session.completed", "data": {"object": {"id": "pi_x"}}}).encode()
+        before = self.counts()
+        self.assertEqual(self.req("POST", "/webhook/stripe", raw, {"Stripe-Signature": sign(raw)})[0], 400)
+        self.assertEqual(self.counts(), before)
+
+    def test_14_unclaimed_reveal_expires_and_is_purged(self):
+        self.webhook("evt_old")
+        self.webhook("evt_old2")
+        with self.db.tx() as tx:
+            tx.execute("UPDATE key_reveals SET expires_at = ? WHERE session_id = ?", (ch.now_ms() - 1, self.sid("evt_old")))
+            tx.execute("UPDATE key_reveals SET created_at = ?, expires_at = ? WHERE session_id = ?",
+                       (ch.now_ms() - ch.REVEAL_TTL_MS - 5, ch.now_ms() - 5, self.sid("evt_old2")))
+        self.assertEqual(ch.REVEAL_TTL_MS, 24 * 3600 * 1000)
+        st, page = self.claim(self.sid("evt_old"))
+        self.assertEqual(st, 410)
+        self.assertIn("24-hour", page)
+        self.assertIsNone(self.key_in(page))
+        with self.db.tx(write=False) as tx:  # the claim purged BOTH expired rows, not only the one asked for
+            self.assertEqual(tx.one("SELECT COUNT(*) FROM key_reveals")[0], 0)
+        self.webhook("evt_fresh")  # a later webhook also purges, and fresh reveals survive
+        with self.db.tx(write=False) as tx:
+            self.assertEqual([r[0] for r in tx.all("SELECT session_id FROM key_reveals")], [self.sid("evt_fresh")])
+        self.assertTrue(self.verify()[0])
+
+    def test_15_plaintext_never_in_chain(self):
+        self.webhook("evt_p")
+        with self.db.tx(write=False) as tx:
+            key = tx.one("SELECT api_key FROM key_reveals")[0]
+            payloads = [r[0] for r in tx.all("SELECT payload FROM blocks")]
+            hashes = [r[0] for r in tx.all("SELECT key_hash FROM api_keys")]
+        self.assertTrue(key.startswith("ch_live_"))
+        self.assertEqual(hashes, [hashlib.sha256(key.encode()).hexdigest()])
+        self.assertFalse(any(key in p or key[len("ch_live_"):] in p or "ch_live_" in p for p in payloads))
+        self.assertIn(self.sid("evt_p"), payloads[-1])  # the session id (not secret) is on the chain for audit
+        self.assertEqual(self.key_in(self.claim(self.sid("evt_p"))[1]), key)
+        with self.db.tx(write=False) as tx:
+            dump = json.dumps([tx.all(f"SELECT * FROM {t}") for t in
+                               ("blocks", "entries", "api_keys", "stripe_events", "stripe_mints", "key_reveals")], default=str)
+        self.assertNotIn(key, dump)  # after the claim the plaintext is nowhere in the database
+
+    def test_16_distinct_events_same_session_mint_once(self):
+        sess = self.sid("evt_A")
+        self.assertEqual(self.webhook("evt_A", session=sess)[0], 200)
+        before, head = self.counts(), self.head()
+        st, body = self.webhook("evt_B", session=sess)
+        self.assertEqual((st, body.get("duplicate"), "api_key" in body), (200, True, False))
+        self.assertEqual(self.webhook("evt_B", session=sess)[1].get("duplicate"), True)  # replay of the 2nd event too
+        out = []
+        ts = [threading.Thread(target=lambda i=i: out.append(self.webhook(f"evt_C{i}", session=sess))) for i in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual([(st, b.get("duplicate")) for st, b in out], [(200, True)] * 8)
+        self.assertEqual((self.counts(), self.head()), (before, head))  # nothing new on the chain
+        with self.db.tx(write=False) as tx:
+            self.assertEqual(tx.one("SELECT COUNT(*) FROM stripe_mints")[0], 1)
+            self.assertEqual(tx.one("SELECT COUNT(*) FROM key_reveals")[0], 1)
+            self.assertEqual(ch.balance(tx, "sys:stripe_clearing"), -500)
+        with self.assertRaises(Exception):  # the UNIQUE (session_id, event_type) constraint itself holds
+            with self.db.tx() as tx:
+                tx.execute("INSERT INTO stripe_mints (session_id, event_type, event_id, seq) VALUES (?, ?, 'evt_Z', 1)",
+                           (sess, "checkout.session.completed"))
+        self.assertEqual(self.claim(sess)[0], 200)
+        self.assertTrue(self.verify()[0])
+
+    def test_17_healthz_and_serve_honors_port_and_requires_secret(self):
+        self.assertEqual(self.req("GET", "/healthz"), (200, {"ok": True, "backend": BACKEND}))
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        here = os.path.dirname(os.path.abspath(__file__))
+        env = {**os.environ, "DATABASE_URL": self.url, "PORT": str(port)}
+        env.pop("STRIPE_WEBHOOK_SECRET", None)
+        r = subprocess.run([sys.executable, "cashhound_engine.py", "serve"], env=env, cwd=here, capture_output=True,
+                           text=True, timeout=30)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("STRIPE_WEBHOOK_SECRET is required", r.stderr)
+        proc = subprocess.Popen([sys.executable, "cashhound_engine.py", "serve"], env={**env, "STRIPE_WEBHOOK_SECRET": SECRET},
+                                cwd=here, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            for _ in range(100):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=2) as resp:
+                        self.assertEqual(json.loads(resp.read()), {"ok": True, "backend": BACKEND})
+                        break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                self.fail("serve did not come up on $PORT")
+        finally:
+            proc.terminate()
+            proc.communicate(timeout=10)
 
 
 if __name__ == "__main__":
